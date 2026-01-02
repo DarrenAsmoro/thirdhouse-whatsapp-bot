@@ -46,12 +46,7 @@ export default async function handler(req, res) {
       // Use a faster model by default for webhook latency
       const aiResult = await withTimeout(callArliAI(text), 9000);
 
-      const replyText =
-        typeof aiResult === "string"
-          ? aiResult
-          : (aiResult && aiResult.reply) ||
-            (aiResult && aiResult.choices?.[0]?.message?.content) ||
-            "Thanks! What date and time would you like?";
+      const replyText = extractReplyText(aiResult);
 
       console.log("AI REPLY", replyText);
 
@@ -85,7 +80,7 @@ async function callArliAI(userText) {
       {
         role: "system",
         content:
-          "You are the WhatsApp auto-reply assistant for Shawarma Beirut. Help with table reservations. Keep replies under 3 short sentences. Ask exactly 1 question if needed (date, time, pax). Do not invent prices or availability. Never mention you are an AI."
+          "You are the WhatsApp auto-reply assistant for Shawarma Beirut. Keep replies under 2 short sentences. Ask exactly 1 question if needed (date, time, pax). Do not invent prices or availability. Never mention you are an AI. IMPORTANT: Output ONLY the message text to send to the customer. Do NOT output JSON, keys, code blocks, or quotes."
       },
       { role: "user", content: userText }
     ]
@@ -161,4 +156,39 @@ function fetchWithTimeout(url, options, ms) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), ms);
   return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(id));
+}
+
+function extractReplyText(aiResult) {
+  // 1) If the model returned an object, prefer .reply
+  if (aiResult && typeof aiResult === "object") {
+    return (
+      aiResult.reply ||
+      aiResult.choices?.[0]?.message?.content?.trim() ||
+      "Hi! What day and time would you like?"
+    );
+  }
+
+  // 2) If the model returned a string, it might be JSON. Try to parse.
+  const s = String(aiResult || "").trim();
+  if (!s) return "Hi! What day and time would you like?";
+
+  // Quick check to avoid parsing normal text
+  if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
+    try {
+      const parsed = JSON.parse(s);
+      if (parsed && typeof parsed === "object") {
+        return (
+          parsed.reply ||
+          parsed.message ||
+          parsed.text ||
+          "Hi! What day and time would you like?"
+        );
+      }
+    } catch {
+      // fall through to return the raw string
+    }
+  }
+
+  // 3) Default: return raw string
+  return s;
 }
