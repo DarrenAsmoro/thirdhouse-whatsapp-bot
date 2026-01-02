@@ -8,6 +8,110 @@ const conversationStore = new Map(); // from -> { messages: Array<{role, content
 const CONVO_TTL_MS = 30 * 60 * 1000;
 const MAX_TURNS = 8; // last N messages (user+assistant)
 
+// Lightweight lead qualification state per user (in-memory)
+const leadStateStore = new Map(); // from -> { service, timeline, budget, brand_name, style, contact_name, contact_channel, references, ts }
+const STATE_TTL_MS = 60 * 60 * 1000;
+
+function getLeadState(from) {
+  const now = Date.now();
+  for (const [k, v] of leadStateStore.entries()) {
+    if (!v?.ts || now - v.ts > STATE_TTL_MS) leadStateStore.delete(k);
+  }
+  const existing = leadStateStore.get(from);
+  if (!existing) {
+    const fresh = {
+      service: null,
+      timeline: null,
+      budget: null,
+      brand_name: null,
+      style: null,
+      contact_name: null,
+      contact_channel: null,
+      references: null,
+      ts: now
+    };
+    leadStateStore.set(from, fresh);
+    return fresh;
+  }
+  existing.ts = now;
+  return existing;
+}
+
+function updateLeadState(from, text) {
+  const s = getLeadState(from);
+  const t = (text || "").trim();
+  const lower = t.toLowerCase();
+
+  // service
+  if (!s.service) {
+    if (/(logo|logotype)/.test(lower)) s.service = "logo";
+    else if (/(branding|brand identity|identity)/.test(lower)) s.service = "branding";
+    else if (/(website|web site|landing page)/.test(lower)) s.service = "website";
+    else if (/(social media|instagram|content|posts)/.test(lower)) s.service = "social media";
+    else if (/(menu design|menu)/.test(lower)) s.service = "menu";
+    else if (/(pitch deck|deck|presentation)/.test(lower)) s.service = "pitch deck";
+  }
+
+  // timeline
+  if (!s.timeline) {
+    const m = t.match(/(in\s*\d+\s*(day|days|week|weeks|month|months))/i);
+    if (m) s.timeline = m[1];
+    else if (/(asap|urgent|today|tomorrow|this week|next week)/.test(lower)) s.timeline = t;
+  }
+
+  // budget
+  if (!s.budget) {
+    if (/(\$|usd|idr|rp\s?|million|k\b)/.test(lower)) s.budget = t;
+    const range = t.match(/\d+\s*[-–]\s*\d+\s*(usd|idr|rp|k|million)/i);
+    if (range) s.budget = t;
+  }
+
+  // contact preference
+  if (!s.contact_channel) {
+    if (lower === "here" || lower.includes("whatsapp")) s.contact_channel = "whatsapp";
+    if (lower.includes("email")) s.contact_channel = "email";
+  }
+
+  // brand name heuristics
+  if (!s.brand_name) {
+    // If they explicitly say it
+    const bn = t.match(/(brand|business)\s*(name)?\s*(is|:)?\s*(.+)/i);
+    if (bn && bn[4]) s.brand_name = bn[4].trim();
+    // If they reply with a short proper name (common after we asked for brand name)
+    if (!s.brand_name && t.length > 2 && t.length <= 40 && !/\s/.test(t) === false) {
+      // keep as-is if it looks like a name and not a sentence
+      if (!/[?.!]/.test(t) && !/(i need|please|can you|want|budget|style|modern|minimal)/.test(lower)) {
+        s.brand_name = t;
+      }
+    }
+  }
+
+  // style
+  if (!s.style) {
+    if (/(modern|minimal|bold|luxury|traditional|clean|playful|vintage|arabic|lebanese)/.test(lower)) s.style = t;
+  }
+
+  // references
+  if (!s.references) {
+    if (/(http|www\.|instagram\.com|behance\.net|dribbble\.com|pinterest\.com)/.test(lower)) s.references = t;
+  }
+
+  s.ts = Date.now();
+  return s;
+}
+
+function getMissingFields(state) {
+  const missing = [];
+  if (!state.service) missing.push("service");
+  if (!state.timeline) missing.push("timeline");
+  if (!state.brand_name) missing.push("brand_name");
+  if (!state.style) missing.push("style");
+  if (!state.budget) missing.push("budget");
+  if (!state.contact_name) missing.push("contact_name");
+  if (!state.contact_channel) missing.push("contact_channel");
+  return missing;
+}
+
 function getConversation(from) {
   const now = Date.now();
 
@@ -128,10 +232,21 @@ export default async function handler(req, res) {
 
       pushTurn(from, "user", text);
 
-      // Quick rule-based responses for speed and to avoid repeated questions
+      const state = updateLeadState(from, text);
+      const missing = getMissingFields(state);
+
+      // Quick rule-based responses for speed and to avoid looping
       const lower = text.toLowerCase();
       if (lower.includes("what do you offer") || lower.includes("services")) {
-        const quick = "We help with branding, logos, websites, social media, menus, and pitch decks. What do you need help with?";
+        const quick = "We do branding, logos, websites, social media, menus, and pitch decks. What are you looking to make?";
+        console.log("AI REPLY", quick);
+        pushTurn(from, "assistant", quick);
+        await withTimeout(sendWhatsAppText(from, quick), 6500);
+        return res.status(200).send("OK");
+      }
+
+      if (lower.includes("collaboration") || lower.includes("collab") || lower.includes("partner")) {
+        const quick = "Yes, we do collaborations depending on the fit. What kind of collaboration are you proposing?";
         console.log("AI REPLY", quick);
         pushTurn(from, "assistant", quick);
         await withTimeout(sendWhatsAppText(from, quick), 6500);
@@ -139,7 +254,7 @@ export default async function handler(req, res) {
       }
 
       // Use a faster model by default for webhook latency
-      const aiResult = await withTimeout(callArliAI(from), 6500);
+      const aiResult = await withTimeout(callArliAI(from, state, missing, text), 6500);
 
       const replyText = extractReplyText(aiResult);
 
@@ -159,7 +274,7 @@ export default async function handler(req, res) {
   return res.status(405).send("Method Not Allowed");
 }
 
-async function callArliAI(from) {
+async function callArliAI(from, state, missing, latestUserText) {
   // Force a faster model if the env var is accidentally set to a slow 70B model
   const envModel = process.env.ARLIAI_MODEL || "";
   const model = envModel.includes("70B") ? "Llama-3.3-27B-Instruct" : (envModel || "Llama-3.3-27B-Instruct");
@@ -176,7 +291,11 @@ async function callArliAI(from) {
       {
         role: "system",
         content:
-          "You are the WhatsApp auto-reply assistant for The Third House, a design agency. Be warm, confident, and concise. Keep replies under 3 short sentences. Ask at most ONE question per message. No emojis. Never mention you are an AI. If the user asks what you offer, list 4 to 6 core services briefly (branding, logo, social media, menus, websites, pitch decks) and ask which one they need. If the user gives you the service and timeline, ask the next missing detail (brand name, then budget range). If they ask for pricing, do not invent numbers; say you will confirm and ask what service + timeline. IMPORTANT: Output ONLY the message text to send to the user. Do NOT output JSON, keys, code blocks, or quotes."
+          "You are the WhatsApp auto-reply assistant for The Third House, a design agency. Write like a real person: natural, specific, not robotic. Keep replies under 3 short sentences. Ask at most ONE question per message. No emojis. Never mention you are an AI. Always answer the user’s question first if they asked one. Use the provided lead context to avoid repeating questions. If the user already gave a field, do not ask it again."
+      },
+      {
+        role: "user",
+        content: `Lead context (do not repeat back verbatim):\n${JSON.stringify({ state, missing }, null, 2)}\n\nLatest user message:\n${latestUserText}`
       },
       ...getConversation(from).messages
     ]
@@ -204,12 +323,19 @@ async function callArliAI(from) {
     return (
       data?.choices?.[0]?.message?.content?.trim() ||
       data?.reply ||
-      nextQuestionFallback(from)
+      "Thanks. What’s the best name to put this under?"
     );
   } catch (err) {
-    // AbortError or network hiccup: return a safe fallback so we can still reply on WhatsApp
-    console.error("ArliAI call failed:", err?.name || "Error", err?.message || err);
-    return nextQuestionFallback(from);
+    // If ArliAI fails, ask the next missing field in a human way
+    const m = Array.isArray(missing) ? missing[0] : null;
+    if (m === "brand_name") return "Great. What’s the brand or business name?";
+    if (m === "style") return "Nice. What style are you aiming for, and any references you like?";
+    if (m === "budget") return "Do you have a budget range in mind for this?";
+    if (m === "timeline") return "When do you need this by?";
+    if (m === "service") return "What do you need designed (logo, branding, website, social, menu, deck)?";
+    if (m === "contact_name") return "What’s the best contact name?";
+    if (m === "contact_channel") return "Should we continue here on WhatsApp or by email?";
+    return "Thanks. What’s the best name to put this under?";
   }
 }
 
