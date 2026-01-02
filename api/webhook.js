@@ -16,19 +16,43 @@ export default async function handler(req, res) {
     // Always respond 200 fast to Meta
     res.status(200).send("OK");
 
-    try {
-      const msg = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-      if (!msg) return;
+    // Debug: confirm the function is receiving POST events
+    console.log("WEBHOOK POST received");
 
+    // Debug: confirm required env vars exist (do not log secrets)
+    console.log("ENV CHECK", {
+      has_META_ACCESS_TOKEN: Boolean(process.env.META_ACCESS_TOKEN),
+      has_PHONE_NUMBER_ID: Boolean(process.env.PHONE_NUMBER_ID),
+      has_ARLIAI_API_KEY: Boolean(process.env.ARLIAI_API_KEY),
+      model: process.env.ARLIAI_MODEL || "Llama-3.3-70B-Instruct"
+    });
+
+    // WhatsApp sends many event types; only proceed if there is an inbound message
+    const value = req.body?.entry?.[0]?.changes?.[0]?.value;
+    const msg = value?.messages?.[0];
+    if (!msg) {
+      console.log("No messages[] in payload (likely status event). Keys:", Object.keys(value || {}));
+      return;
+    }
+
+    try {
       const from = msg.from;
       const text = msg?.text?.body;
-      if (!text) return;
+
+      console.log("INBOUND MESSAGE", { from, text, type: msg?.type });
+
+      if (!text) {
+        console.log("Message has no text body; skipping.");
+        return;
+      }
 
       // Call ArliAI to generate a reply
       const reply = await callArliAI(text);
+      console.log("AI REPLY", reply);
 
       // Send reply back to WhatsApp
-      await sendWhatsAppText(from, reply);
+      const sendResult = await sendWhatsAppText(from, reply);
+      console.log("WHATSAPP SEND RESULT", sendResult);
     } catch (err) {
       console.error("Webhook error:", err);
     }
@@ -66,6 +90,9 @@ async function callArliAI(userText) {
   });
 
   const data = await r.json();
+  if (!r.ok) {
+    console.error("ArliAI error:", r.status, data);
+  }
   return data?.choices?.[0]?.message?.content?.trim() || "Thanks! What date and time would you like?";
 }
 
@@ -90,6 +117,7 @@ async function sendWhatsAppText(to, body) {
   });
 
   const out = await r.json();
+  console.log("WHATSAPP SEND HTTP", { ok: r.ok, status: r.status });
   if (!r.ok) console.error("WhatsApp send error:", r.status, out);
   return out;
 }
