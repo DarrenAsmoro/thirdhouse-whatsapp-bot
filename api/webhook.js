@@ -13,9 +13,6 @@ export default async function handler(req, res) {
 
   // 2) Incoming message events (POST)
   if (req.method === "POST") {
-    // Always respond 200 fast to Meta
-    res.status(200).send("OK");
-
     // Debug: confirm the function is receiving POST events
     console.log("WEBHOOK POST received");
 
@@ -47,15 +44,18 @@ export default async function handler(req, res) {
       }
 
       // Call ArliAI to generate a reply
-      const reply = await callArliAI(text);
+      const reply = await withTimeout(callArliAI(text), 8000);
       console.log("AI REPLY", reply);
 
       // Send reply back to WhatsApp
-      const sendResult = await sendWhatsAppText(from, reply);
+      const sendResult = await withTimeout(sendWhatsAppText(from, reply), 8000);
       console.log("WHATSAPP SEND RESULT", sendResult);
     } catch (err) {
-      console.error("Webhook error:", err);
+      console.error("Webhook error:", err?.message || err);
     }
+
+    // Respond to Meta after processing (must be within Meta timeout)
+    res.status(200).send("OK");
 
     return;
   }
@@ -68,7 +68,7 @@ async function callArliAI(userText) {
     model: process.env.ARLIAI_MODEL || "Llama-3.3-70B-Instruct",
     hide_thinking: true,
     temperature: 0.2,
-    max_completion_tokens: 160,
+    max_completion_tokens: 120,
     stream: false,
     messages: [
       {
@@ -120,4 +120,13 @@ async function sendWhatsAppText(to, body) {
   console.log("WHATSAPP SEND HTTP", { ok: r.ok, status: r.status });
   if (!r.ok) console.error("WhatsApp send error:", r.status, out);
   return out;
+}
+
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms)
+    )
+  ]);
 }
