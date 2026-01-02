@@ -1,5 +1,6 @@
 // Simple in-memory dedupe to avoid replying multiple times when Meta retries webhooks
 const processedMessageIds = new Map(); // id -> timestamp
+const processedMessageKeys = new Map(); // key -> timestamp
 const DEDUPE_TTL_MS = 5 * 60 * 1000;
 
 // Simple per-user conversation memory (in-memory). For production-grade, use Redis/DB.
@@ -51,6 +52,20 @@ function isDuplicateMessage(id) {
   return false;
 }
 
+function isDuplicateKey(key) {
+  if (!key) return false;
+  const now = Date.now();
+
+  // prune old keys
+  for (const [k, ts] of processedMessageKeys.entries()) {
+    if (now - ts > DEDUPE_TTL_MS) processedMessageKeys.delete(k);
+  }
+
+  if (processedMessageKeys.has(key)) return true;
+  processedMessageKeys.set(key, now);
+  return false;
+}
+
 export default async function handler(req, res) {
   // 1) Verification (GET)
   if (req.method === "GET") {
@@ -85,10 +100,23 @@ export default async function handler(req, res) {
       return res.status(200).send("OK");
     }
     const messageId = msg.id;
+
+    const msgTs = msg.timestamp;
+    const msgText = msg?.text?.body || "";
+    const key = `${msg.from}:${msgTs}:${msgText}`;
+
     if (isDuplicateMessage(messageId)) {
       console.log("DUPLICATE MESSAGE ignored", { messageId });
       return res.status(200).send("OK");
     }
+
+    if (isDuplicateKey(key)) {
+      console.log("DUPLICATE KEY ignored", { key });
+      return res.status(200).send("OK");
+    }
+
+    // Acknowledge quickly to reduce Meta retries; continue processing after sending
+    res.status(200).send("OK");
 
     try {
       const from = msg.from;
@@ -98,7 +126,7 @@ export default async function handler(req, res) {
 
       if (!text) {
         console.log("Message has no text body; skipping.");
-        return res.status(200).send("OK");
+        return;
       }
 
       pushTurn(from, "user", text);
@@ -110,11 +138,11 @@ export default async function handler(req, res) {
         console.log("AI REPLY", quick);
         pushTurn(from, "assistant", quick);
         await withTimeout(sendWhatsAppText(from, quick), 7000);
-        return res.status(200).send("OK");
+        return;
       }
 
       // Use a faster model by default for webhook latency
-      const aiResult = await withTimeout(callArliAI(from), 7000);
+      const aiResult = await withTimeout(callArliAI(from), 9500);
 
       const replyText = extractReplyText(aiResult);
 
@@ -124,10 +152,10 @@ export default async function handler(req, res) {
       const sendResult = await withTimeout(sendWhatsAppText(from, replyText), 7000);
       console.log("WHATSAPP SEND RESULT", sendResult);
 
-      return res.status(200).send("OK");
+      return;
     } catch (err) {
       console.error("Webhook error:", err?.message || err);
-      return res.status(200).send("OK");
+      return;
     }
   }
 
@@ -168,7 +196,7 @@ async function callArliAI(from) {
         },
         body: JSON.stringify(payload)
       },
-      6500
+      9000
     );
 
     const data = await r.json();
@@ -179,12 +207,12 @@ async function callArliAI(from) {
     return (
       data?.choices?.[0]?.message?.content?.trim() ||
       data?.reply ||
-      "Thanks. What’s your brand or business name, and what style references do you like?"
+      nextQuestionFallback(from)
     );
   } catch (err) {
     // AbortError or network hiccup: return a safe fallback so we can still reply on WhatsApp
     console.error("ArliAI call failed:", err?.name || "Error", err?.message || err);
-    return "Thanks. What’s your brand or business name, and what style references do you like?";
+    return nextQuestionFallback(from);
   }
 }
 
@@ -262,4 +290,36 @@ function extractReplyText(aiResult) {
 
   // 3) Default: return raw string
   return s;
+}
+
+function nextQuestionFallback(from) {
+  const convo = getConversation(from).messages || [];
+  const lastUser = [...convo].reverse().find(m => m.role === "user")?.content?.toLowerCase() || "";
+  const allText = convo.map(m => (m.content || "").toLowerCase()).join(" \n");
+
+  const hasService = /(logo|branding|brand|website|web|social|pitch deck|menu)/.test(allText);
+  const hasTimeline = /(tomorrow|today|week|weeks|month|months|deadline|by\s)/.test(allText);
+  const hasBrandName = /(brand is|business name|we are|called|name is)/.test(allText);
+  const hasStyle = /(modern|minimal|bold|luxury|traditional|clean|playful|ref|reference|style)/.test(allText);
+  const hasBudget = /(budget|idr|usd|rp\s?|million|k\b)/.test(allText);
+
+  // If the user is clearly answering the last question, move forward
+  if (hasService && (hasBrandName || lastUser.length > 2) && hasStyle && !hasBudget) {
+    return "Got it. Do you have a budget range in mind for this logo?";
+  }
+
+  if (hasService && hasTimeline && !hasBrandName) {
+    return "Great. What’s the brand or business name?";
+  }
+
+  if (hasService && hasBrandName && !hasStyle) {
+    return "Nice. What style do you want (modern, minimal, bold, etc.) or any references?";
+  }
+
+  if (hasService && hasBrandName && hasStyle && hasBudget) {
+    return "Perfect. What’s the best contact name, and should we continue here or by email?";
+  }
+
+  // Default
+  return "Thanks for the details. What’s your brand or business name and what style do you like?";
 }
