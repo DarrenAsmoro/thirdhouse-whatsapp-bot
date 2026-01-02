@@ -44,7 +44,7 @@ export default async function handler(req, res) {
       }
 
       // Use a faster model by default for webhook latency
-      const aiResult = await withTimeout(callArliAI(text), 7000);
+      const aiResult = await withTimeout(callArliAI(text), 9000);
 
       const replyText =
         typeof aiResult === "string"
@@ -69,8 +69,14 @@ export default async function handler(req, res) {
 }
 
 async function callArliAI(userText) {
+  // Force a faster model if the env var is accidentally set to a slow 70B model
+  const envModel = process.env.ARLIAI_MODEL || "";
+  const model = envModel.includes("70B") ? "Llama-3.3-27B-Instruct" : (envModel || "Llama-3.3-27B-Instruct");
+
+  console.log("ARLIAI MODEL USED", model);
+
   const payload = {
-    model: process.env.ARLIAI_MODEL || "Llama-3.3-27B-Instruct",
+    model,
     hide_thinking: true,
     temperature: 0.2,
     max_completion_tokens: 40,
@@ -85,20 +91,35 @@ async function callArliAI(userText) {
     ]
   };
 
-  const r = await fetchWithTimeout("https://api.arliai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.ARLIAI_API_KEY}`
-    },
-    body: JSON.stringify(payload)
-  }, 6500);
+  try {
+    const r = await fetchWithTimeout(
+      "https://api.arliai.com/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.ARLIAI_API_KEY}`
+        },
+        body: JSON.stringify(payload)
+      },
+      8500
+    );
 
-  const data = await r.json();
-  if (!r.ok) {
-    console.error("ArliAI error:", r.status, data);
+    const data = await r.json();
+    if (!r.ok) {
+      console.error("ArliAI error:", r.status, data);
+    }
+
+    return (
+      data?.choices?.[0]?.message?.content?.trim() ||
+      data?.reply ||
+      "Hi! Would you like to dine in or takeaway, and what day/time?"
+    );
+  } catch (err) {
+    // AbortError or network hiccup: return a safe fallback so we can still reply on WhatsApp
+    console.error("ArliAI call failed:", err?.name || "Error", err?.message || err);
+    return "Hi! Would you like to dine in or takeaway, and what day/time?";
   }
-  return data?.choices?.[0]?.message?.content?.trim() || data?.reply || "Thanks! What date and time would you like?";
 }
 
 async function sendWhatsAppText(to, body) {
