@@ -2,6 +2,41 @@
 const processedMessageIds = new Map(); // id -> timestamp
 const DEDUPE_TTL_MS = 5 * 60 * 1000;
 
+// Simple per-user conversation memory (in-memory). For production-grade, use Redis/DB.
+const conversationStore = new Map(); // from -> { messages: Array<{role, content}>, ts: number }
+const CONVO_TTL_MS = 30 * 60 * 1000;
+const MAX_TURNS = 8; // last N messages (user+assistant)
+
+function getConversation(from) {
+  const now = Date.now();
+
+  // prune old conversations
+  for (const [k, v] of conversationStore.entries()) {
+    if (!v?.ts || now - v.ts > CONVO_TTL_MS) conversationStore.delete(k);
+  }
+
+  const existing = conversationStore.get(from);
+  if (!existing) {
+    const fresh = { messages: [], ts: now };
+    conversationStore.set(from, fresh);
+    return fresh;
+  }
+
+  existing.ts = now;
+  return existing;
+}
+
+function pushTurn(from, role, content) {
+  if (!from || !content) return;
+  const convo = getConversation(from);
+  convo.messages.push({ role, content });
+  // keep only last MAX_TURNS turns
+  if (convo.messages.length > MAX_TURNS) {
+    convo.messages = convo.messages.slice(convo.messages.length - MAX_TURNS);
+  }
+  convo.ts = Date.now();
+}
+
 function isDuplicateMessage(id) {
   if (!id) return false;
   const now = Date.now();
@@ -66,12 +101,25 @@ export default async function handler(req, res) {
         return res.status(200).send("OK");
       }
 
+      pushTurn(from, "user", text);
+
+      // Quick rule-based responses for speed and to avoid repeated questions
+      const lower = text.toLowerCase();
+      if (lower.includes("what do you offer") || lower.includes("services")) {
+        const quick = "We help with branding, logos, websites, social media, menus, and pitch decks. What do you need help with?";
+        console.log("AI REPLY", quick);
+        pushTurn(from, "assistant", quick);
+        await withTimeout(sendWhatsAppText(from, quick), 7000);
+        return res.status(200).send("OK");
+      }
+
       // Use a faster model by default for webhook latency
-      const aiResult = await withTimeout(callArliAI(text), 7000);
+      const aiResult = await withTimeout(callArliAI(from), 7000);
 
       const replyText = extractReplyText(aiResult);
 
       console.log("AI REPLY", replyText);
+      pushTurn(from, "assistant", replyText);
 
       const sendResult = await withTimeout(sendWhatsAppText(from, replyText), 7000);
       console.log("WHATSAPP SEND RESULT", sendResult);
@@ -86,7 +134,7 @@ export default async function handler(req, res) {
   return res.status(405).send("Method Not Allowed");
 }
 
-async function callArliAI(userText) {
+async function callArliAI(from) {
   // Force a faster model if the env var is accidentally set to a slow 70B model
   const envModel = process.env.ARLIAI_MODEL || "";
   const model = envModel.includes("70B") ? "Llama-3.3-27B-Instruct" : (envModel || "Llama-3.3-27B-Instruct");
@@ -103,9 +151,9 @@ async function callArliAI(userText) {
       {
         role: "system",
         content:
-          "You are the WhatsApp auto-reply assistant for The Third House, a design agency. Be warm, confident, and concise. Keep replies under 3 short sentences. Ask at most ONE question per message. No emojis. Never mention you are an AI. If the user asks what you offer, list 4 to 6 core services briefly (branding, logo, social media, menus, websites, pitch decks) and ask which one they need. If they ask for pricing, do not invent numbers; say you will confirm and ask what service + timeline. IMPORTANT: Output ONLY the message text to send to the user. Do NOT output JSON, keys, code blocks, or quotes."
+          "You are the WhatsApp auto-reply assistant for The Third House, a design agency. Be warm, confident, and concise. Keep replies under 3 short sentences. Ask at most ONE question per message. No emojis. Never mention you are an AI. If the user asks what you offer, list 4 to 6 core services briefly (branding, logo, social media, menus, websites, pitch decks) and ask which one they need. If the user gives you the service and timeline, ask the next missing detail (brand name, then budget range). If they ask for pricing, do not invent numbers; say you will confirm and ask what service + timeline. IMPORTANT: Output ONLY the message text to send to the user. Do NOT output JSON, keys, code blocks, or quotes."
       },
-      { role: "user", content: userText }
+      ...getConversation(from).messages
     ]
   };
 
@@ -131,12 +179,12 @@ async function callArliAI(userText) {
     return (
       data?.choices?.[0]?.message?.content?.trim() ||
       data?.reply ||
-      "Thanks for reaching out. What service do you need and when is your deadline?"
+      "Thanks. What’s your brand or business name, and what style references do you like?"
     );
   } catch (err) {
     // AbortError or network hiccup: return a safe fallback so we can still reply on WhatsApp
     console.error("ArliAI call failed:", err?.name || "Error", err?.message || err);
-    return "Thanks for reaching out. What service do you need and when is your deadline?";
+    return "Thanks. What’s your brand or business name, and what style references do you like?";
   }
 }
 
