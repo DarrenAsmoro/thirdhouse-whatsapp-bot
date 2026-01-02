@@ -21,7 +21,7 @@ export default async function handler(req, res) {
       has_META_ACCESS_TOKEN: Boolean(process.env.META_ACCESS_TOKEN),
       has_PHONE_NUMBER_ID: Boolean(process.env.PHONE_NUMBER_ID),
       has_ARLIAI_API_KEY: Boolean(process.env.ARLIAI_API_KEY),
-      model: process.env.ARLIAI_MODEL || "Llama-3.3-70B-Instruct"
+      model: process.env.ARLIAI_MODEL || "Llama-3.3-27B-Instruct"
     });
 
     // WhatsApp sends many event types; only proceed if there is an inbound message
@@ -32,44 +32,37 @@ export default async function handler(req, res) {
       return;
     }
 
-    // Respond to Meta immediately to avoid webhook timeouts
-    res.status(200).send("OK");
+    try {
+      const from = msg.from;
+      const text = msg?.text?.body;
 
-    // Continue processing asynchronously (best effort on serverless)
-    queueMicrotask(async () => {
-      try {
-        const from = msg.from;
-        const text = msg?.text?.body;
+      console.log("INBOUND MESSAGE", { from, text, type: msg?.type });
 
-        console.log("INBOUND MESSAGE", { from, text, type: msg?.type });
-
-        if (!text) {
-          console.log("Message has no text body; skipping.");
-          return;
-        }
-
-        // Call ArliAI to generate a reply (allow more time)
-        const aiResult = await withTimeout(callArliAI(text), 20000);
-
-        // Support both string replies and structured JSON replies
-        const replyText =
-          typeof aiResult === "string"
-            ? aiResult
-            : (aiResult && aiResult.reply) ||
-              (aiResult && aiResult.choices?.[0]?.message?.content) ||
-              "Thanks! What date and time would you like?";
-
-        console.log("AI REPLY", replyText);
-
-        // Send reply back to WhatsApp
-        const sendResult = await withTimeout(sendWhatsAppText(from, replyText), 12000);
-        console.log("WHATSAPP SEND RESULT", sendResult);
-      } catch (err) {
-        console.error("Webhook error:", err?.message || err);
+      if (!text) {
+        console.log("Message has no text body; skipping.");
+        return res.status(200).send("OK");
       }
-    });
 
-    return;
+      // Use a faster model by default for webhook latency
+      const aiResult = await withTimeout(callArliAI(text), 7000);
+
+      const replyText =
+        typeof aiResult === "string"
+          ? aiResult
+          : (aiResult && aiResult.reply) ||
+            (aiResult && aiResult.choices?.[0]?.message?.content) ||
+            "Thanks! What date and time would you like?";
+
+      console.log("AI REPLY", replyText);
+
+      const sendResult = await withTimeout(sendWhatsAppText(from, replyText), 7000);
+      console.log("WHATSAPP SEND RESULT", sendResult);
+
+      return res.status(200).send("OK");
+    } catch (err) {
+      console.error("Webhook error:", err?.message || err);
+      return res.status(200).send("OK");
+    }
   }
 
   return res.status(405).send("Method Not Allowed");
@@ -77,10 +70,10 @@ export default async function handler(req, res) {
 
 async function callArliAI(userText) {
   const payload = {
-    model: process.env.ARLIAI_MODEL || "Llama-3.3-70B-Instruct",
+    model: process.env.ARLIAI_MODEL || "Llama-3.3-27B-Instruct",
     hide_thinking: true,
     temperature: 0.2,
-    max_completion_tokens: 60,
+    max_completion_tokens: 40,
     stream: false,
     messages: [
       {
@@ -92,14 +85,14 @@ async function callArliAI(userText) {
     ]
   };
 
-  const r = await fetch("https://api.arliai.com/v1/chat/completions", {
+  const r = await fetchWithTimeout("https://api.arliai.com/v1/chat/completions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${process.env.ARLIAI_API_KEY}`
     },
     body: JSON.stringify(payload)
-  });
+  }, 6500);
 
   const data = await r.json();
   if (!r.ok) {
@@ -141,4 +134,10 @@ function withTimeout(promise, ms) {
       setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms)
     )
   ]);
+}
+
+function fetchWithTimeout(url, options, ms) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), ms);
+  return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(id));
 }
