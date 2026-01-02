@@ -32,30 +32,42 @@ export default async function handler(req, res) {
       return;
     }
 
-    try {
-      const from = msg.from;
-      const text = msg?.text?.body;
-
-      console.log("INBOUND MESSAGE", { from, text, type: msg?.type });
-
-      if (!text) {
-        console.log("Message has no text body; skipping.");
-        return;
-      }
-
-      // Call ArliAI to generate a reply
-      const reply = await withTimeout(callArliAI(text), 8000);
-      console.log("AI REPLY", reply);
-
-      // Send reply back to WhatsApp
-      const sendResult = await withTimeout(sendWhatsAppText(from, reply), 8000);
-      console.log("WHATSAPP SEND RESULT", sendResult);
-    } catch (err) {
-      console.error("Webhook error:", err?.message || err);
-    }
-
-    // Respond to Meta after processing (must be within Meta timeout)
+    // Respond to Meta immediately to avoid webhook timeouts
     res.status(200).send("OK");
+
+    // Continue processing asynchronously (best effort on serverless)
+    queueMicrotask(async () => {
+      try {
+        const from = msg.from;
+        const text = msg?.text?.body;
+
+        console.log("INBOUND MESSAGE", { from, text, type: msg?.type });
+
+        if (!text) {
+          console.log("Message has no text body; skipping.");
+          return;
+        }
+
+        // Call ArliAI to generate a reply (allow more time)
+        const aiResult = await withTimeout(callArliAI(text), 20000);
+
+        // Support both string replies and structured JSON replies
+        const replyText =
+          typeof aiResult === "string"
+            ? aiResult
+            : (aiResult && aiResult.reply) ||
+              (aiResult && aiResult.choices?.[0]?.message?.content) ||
+              "Thanks! What date and time would you like?";
+
+        console.log("AI REPLY", replyText);
+
+        // Send reply back to WhatsApp
+        const sendResult = await withTimeout(sendWhatsAppText(from, replyText), 12000);
+        console.log("WHATSAPP SEND RESULT", sendResult);
+      } catch (err) {
+        console.error("Webhook error:", err?.message || err);
+      }
+    });
 
     return;
   }
@@ -68,7 +80,7 @@ async function callArliAI(userText) {
     model: process.env.ARLIAI_MODEL || "Llama-3.3-70B-Instruct",
     hide_thinking: true,
     temperature: 0.2,
-    max_completion_tokens: 120,
+    max_completion_tokens: 60,
     stream: false,
     messages: [
       {
@@ -93,7 +105,7 @@ async function callArliAI(userText) {
   if (!r.ok) {
     console.error("ArliAI error:", r.status, data);
   }
-  return data?.choices?.[0]?.message?.content?.trim() || "Thanks! What date and time would you like?";
+  return data?.choices?.[0]?.message?.content?.trim() || data?.reply || "Thanks! What date and time would you like?";
 }
 
 async function sendWhatsAppText(to, body) {
