@@ -115,9 +115,6 @@ export default async function handler(req, res) {
       return res.status(200).send("OK");
     }
 
-    // Acknowledge quickly to reduce Meta retries; continue processing after sending
-    res.status(200).send("OK");
-
     try {
       const from = msg.from;
       const text = msg?.text?.body;
@@ -126,7 +123,7 @@ export default async function handler(req, res) {
 
       if (!text) {
         console.log("Message has no text body; skipping.");
-        return;
+        return res.status(200).send("OK");
       }
 
       pushTurn(from, "user", text);
@@ -137,25 +134,25 @@ export default async function handler(req, res) {
         const quick = "We help with branding, logos, websites, social media, menus, and pitch decks. What do you need help with?";
         console.log("AI REPLY", quick);
         pushTurn(from, "assistant", quick);
-        await withTimeout(sendWhatsAppText(from, quick), 7000);
-        return;
+        await withTimeout(sendWhatsAppText(from, quick), 6500);
+        return res.status(200).send("OK");
       }
 
       // Use a faster model by default for webhook latency
-      const aiResult = await withTimeout(callArliAI(from), 9500);
+      const aiResult = await withTimeout(callArliAI(from), 6500);
 
       const replyText = extractReplyText(aiResult);
 
       console.log("AI REPLY", replyText);
       pushTurn(from, "assistant", replyText);
 
-      const sendResult = await withTimeout(sendWhatsAppText(from, replyText), 7000);
+      const sendResult = await withTimeout(sendWhatsAppText(from, replyText), 6500);
       console.log("WHATSAPP SEND RESULT", sendResult);
 
-      return;
+      return res.status(200).send("OK");
     } catch (err) {
       console.error("Webhook error:", err?.message || err);
-      return;
+      return res.status(200).send("OK");
     }
   }
 
@@ -173,7 +170,7 @@ async function callArliAI(from) {
     model,
     hide_thinking: true,
     temperature: 0.2,
-    max_completion_tokens: 40,
+    max_completion_tokens: 30,
     stream: false,
     messages: [
       {
@@ -196,7 +193,7 @@ async function callArliAI(from) {
         },
         body: JSON.stringify(payload)
       },
-      9000
+      6000
     );
 
     const data = await r.json();
@@ -309,7 +306,7 @@ function nextQuestionFallback(from) {
   }
 
   if (hasService && hasTimeline && !hasBrandName) {
-    return "Great. What’s the brand or business name?";
+    return "Great. What's the brand or business name?";
   }
 
   if (hasService && hasBrandName && !hasStyle) {
@@ -317,9 +314,9 @@ function nextQuestionFallback(from) {
   }
 
   if (hasService && hasBrandName && hasStyle && hasBudget) {
-    return "Perfect. What’s the best contact name, and should we continue here or by email?";
+    return "Perfect. What's the best contact name, and should we continue here or by email?";
   }
 
   // Default
-  return "Thanks for the details. What’s your brand or business name and what style do you like?";
+  return "Thanks for the details. What's your brand or business name and what style do you like?";
 }
