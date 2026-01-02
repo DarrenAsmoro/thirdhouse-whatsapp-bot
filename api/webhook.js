@@ -1,3 +1,21 @@
+// Simple in-memory dedupe to avoid replying multiple times when Meta retries webhooks
+const processedMessageIds = new Map(); // id -> timestamp
+const DEDUPE_TTL_MS = 5 * 60 * 1000;
+
+function isDuplicateMessage(id) {
+  if (!id) return false;
+  const now = Date.now();
+
+  // prune old ids
+  for (const [k, ts] of processedMessageIds.entries()) {
+    if (now - ts > DEDUPE_TTL_MS) processedMessageIds.delete(k);
+  }
+
+  if (processedMessageIds.has(id)) return true;
+  processedMessageIds.set(id, now);
+  return false;
+}
+
 export default async function handler(req, res) {
   // 1) Verification (GET)
   if (req.method === "GET") {
@@ -29,7 +47,12 @@ export default async function handler(req, res) {
     const msg = value?.messages?.[0];
     if (!msg) {
       console.log("No messages[] in payload (likely status event). Keys:", Object.keys(value || {}));
-      return;
+      return res.status(200).send("OK");
+    }
+    const messageId = msg.id;
+    if (isDuplicateMessage(messageId)) {
+      console.log("DUPLICATE MESSAGE ignored", { messageId });
+      return res.status(200).send("OK");
     }
 
     try {
@@ -44,7 +67,7 @@ export default async function handler(req, res) {
       }
 
       // Use a faster model by default for webhook latency
-      const aiResult = await withTimeout(callArliAI(text), 9000);
+      const aiResult = await withTimeout(callArliAI(text), 7000);
 
       const replyText = extractReplyText(aiResult);
 
@@ -80,7 +103,7 @@ async function callArliAI(userText) {
       {
         role: "system",
         content:
-          "You are the WhatsApp auto-reply assistant for Shawarma Beirut. Keep replies under 2 short sentences. Ask exactly 1 question if needed (date, time, pax). Do not invent prices or availability. Never mention you are an AI. IMPORTANT: Output ONLY the message text to send to the customer. Do NOT output JSON, keys, code blocks, or quotes."
+          "You are the WhatsApp auto-reply assistant for The Third House, a design agency. Be warm, confident, and concise. Keep replies under 3 short sentences. Ask at most ONE question per message. No emojis. Never mention you are an AI. If the user asks what you offer, list 4 to 6 core services briefly (branding, logo, social media, menus, websites, pitch decks) and ask which one they need. If they ask for pricing, do not invent numbers; say you will confirm and ask what service + timeline. IMPORTANT: Output ONLY the message text to send to the user. Do NOT output JSON, keys, code blocks, or quotes."
       },
       { role: "user", content: userText }
     ]
@@ -97,7 +120,7 @@ async function callArliAI(userText) {
         },
         body: JSON.stringify(payload)
       },
-      8500
+      6500
     );
 
     const data = await r.json();
@@ -108,12 +131,12 @@ async function callArliAI(userText) {
     return (
       data?.choices?.[0]?.message?.content?.trim() ||
       data?.reply ||
-      "Hi! Would you like to dine in or takeaway, and what day/time?"
+      "Thanks for reaching out. What service do you need and when is your deadline?"
     );
   } catch (err) {
     // AbortError or network hiccup: return a safe fallback so we can still reply on WhatsApp
     console.error("ArliAI call failed:", err?.name || "Error", err?.message || err);
-    return "Hi! Would you like to dine in or takeaway, and what day/time?";
+    return "Thanks for reaching out. What service do you need and when is your deadline?";
   }
 }
 
